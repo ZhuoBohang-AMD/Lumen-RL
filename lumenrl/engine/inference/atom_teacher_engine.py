@@ -254,6 +254,21 @@ if _unknown:
         f"They are not fields of atom.config.Config -- check for typos."
     )
 
+# The runner processes inherit this path at spawn. TP rank 0 rewrites cumulative
+# capture and Mooncake put counters there after every capture forward.
+runner_perf_path = os.path.join(hidden_dir, f"runner_perf.{os.getpid()}.json")
+os.environ["LUMENRL_RUNNER_PERF_FILE"] = runner_perf_path
+runner_perf_prev = {}
+
+
+def read_runner_perf():
+    try:
+        with open(runner_perf_path) as perf_file:
+            return json.load(perf_file)
+    except (OSError, ValueError):
+        return {}
+
+
 logger.info("Creating AsyncLLMEngine: %s", engine_kwargs)
 engine = AsyncLLMEngine(model_path, **engine_kwargs)
 logger.info("AsyncLLMEngine created successfully")
@@ -371,6 +386,7 @@ for line in cmd_f:
     cmd = msg["cmd"]
 
     if cmd == "extract_hidden":
+        prep_start = time.monotonic()
         input_path = msg["input_path"]
         data = torch.load(input_path, map_location="cpu", weights_only=True)
         input_ids_batch = data["input_ids"]  # [B, T], right-padded
@@ -392,19 +408,40 @@ for line in cmd_f:
 
         key_prefix = os.environ.get("LUMENRL_ATOM_KEY_PREFIX", f"atom_{os.getpid()}")
         data_ids = [f"{key_prefix}_x{req_counter}_{i}" for i in range(B)]
+        # "@<segment>" makes the store place the row in its consumer's segment.
+        row_segments = data.get("row_segments")
+        if row_segments:
+            data_ids = [f"{data_id}@{segment}" for data_id, segment in zip(data_ids, row_segments, strict=True)]
 
         t0 = time.monotonic()
         engine.generate_hidden_states(rows, data_ids)
         elapsed = time.monotonic() - t0
+        num_tokens = sum(len(r) for r in rows)
         logger.info(
             "extract_hidden: B=%d, T=%d, tokens=%d, %.2fs",
-            B, T, sum(len(r) for r in rows), elapsed,
+            B, T, num_tokens, elapsed,
+        )
+        # The last row's async put may still be in flight here; its time lands
+        # in the next batch's delta. Peaks are running maxima, not sums.
+        runner_perf = read_runner_perf()
+        perf = {
+            key: value if key.endswith("_peak_bytes")
+            else value - runner_perf_prev.get(key, 0.0)
+            for key, value in runner_perf.items()
+        }
+        runner_perf_prev = runner_perf
+        perf.update(
+            prep_s=t0 - prep_start,
+            extract_s=elapsed,
+            rows=B,
+            tokens=num_tokens,
         )
 
         resp_f.write(json.dumps({
             "status": "ok", "B": B, "T": T, "D": hidden_dim,
             "mooncake_keys": data_ids,
             "seq_lens": {k: len(r) for k, r in zip(data_ids, rows)},
+            "perf": perf,
         }) + "\\n")
         resp_f.flush()
         del data, input_ids_batch, rows
@@ -1237,12 +1274,14 @@ class AtomTeacherEngine:
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
+        row_segments: list[str] | None = None,
     ) -> dict[str, Any]:
         """Run extraction but leave tensors in Mooncake for a remote consumer.
 
         The returned object contains only keys and tensor-shape metadata.  This
         is the disaggregated teacher API: Ray carries the small manifest while
         hidden states stay in Mooncake and cross nodes through its data plane.
+        ``row_segments`` names, per row, the Mooncake segment to place it in.
         """
         if not self.is_alive:
             self.start(mode="extract")
@@ -1259,10 +1298,17 @@ class AtomTeacherEngine:
             self._req_counter += 1
             tag = f"req_{self._req_counter}"
             input_path = os.path.join(self._hidden_dir, f"{tag}_input.pt")
-            torch.save(
-                {"input_ids": input_ids.cpu(), "lengths": lengths},
-                input_path,
-            )
+            save_start = time.monotonic()
+            payload = {"input_ids": input_ids.cpu(), "lengths": lengths}
+            if row_segments is not None:
+                if len(row_segments) != int(input_ids.shape[0]):
+                    raise ValueError(
+                        f"{len(row_segments)} row segments for a batch of "
+                        f"{int(input_ids.shape[0])} rows"
+                    )
+                payload["row_segments"] = list(row_segments)
+            torch.save(payload, input_path)
+            cmd_start = time.monotonic()
             try:
                 resp = self._send_cmd_unlocked({
                     "cmd": "extract_hidden",
@@ -1273,6 +1319,7 @@ class AtomTeacherEngine:
                     os.remove(input_path)
                 except FileNotFoundError:
                     pass
+            cmd_s = time.monotonic() - cmd_start
 
         if resp.get("status") != "ok":
             raise RuntimeError(f"extract_hidden failed: {resp}")
@@ -1288,6 +1335,11 @@ class AtomTeacherEngine:
             "aux_layer_ids": list(self._aux_layer_indices),
             "kv_cache_dtype": self._atom_config.get("kv_cache_dtype"),
             "index_cache_dtype": self._atom_config.get("index_cache_dtype"),
+            "teacher_perf": {
+                **resp.get("perf", {}),
+                "save_s": cmd_start - save_start,
+                "cmd_s": cmd_s,
+            },
         }
 
     def generate_tokens(

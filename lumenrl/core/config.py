@@ -477,6 +477,24 @@ class SpecDistillConfig:
     teacher_replicas: int = 1
     teacher_actor_prefix: str = "kimi-k3-sddd-teacher"
     stream_prefetch_batches: int = 8
+    # Draft side of the stream: read a step's rows with batch_get_into straight
+    # into one of two pinned receive slots per rank, instead of a get plus clone
+    # per row. A slot holds one step of a rank's rows, i.e. its tokens times
+    # ((num_aux_layers + 1) * hidden_dim * 2 + 8) bytes (84 KiB a token for K3;
+    # the 5-node run's heaviest step was 4.6 GiB at 8 draft ranks). A step that
+    # needs more grows its slot to the next power of two up to the maximum; a
+    # step above that takes the per-row path.
+    disagg_batch_receive: bool = False
+    disagg_receive_slot_size: str = "8GB"
+    disagg_receive_slot_max_size: str = "32GB"
+    # Ask the master to place every teacher row in the segment of the draft rank
+    # that reads it, so a row crosses the network once (the teacher's put) and
+    # the draft reads its own segment. Prefill mode only. A draft segment
+    # (LUMENRL_DRAFT_MOONCAKE_SEGMENT_SIZE) has to hold the batches in flight,
+    # about (stream_prefetch_batches + 2) times a rank's average step (3.4 GiB
+    # in the 5-node run, which used 64GB); rows that find it full land in other
+    # segments and are read over the network, and the fetch logs a warning.
+    disagg_place_in_consumer: bool = False
     teacher_weights_path: str = "/tmp/lumenrl_teacher_static_weights.pt"
     # DSpark loss weights
     ce_loss_alpha: float = 0.1

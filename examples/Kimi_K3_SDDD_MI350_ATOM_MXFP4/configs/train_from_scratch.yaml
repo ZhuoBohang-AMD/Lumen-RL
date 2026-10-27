@@ -53,9 +53,17 @@ algorithm:
     sequential_mode: streaming_disaggregated
     teacher_replicas: 4
     teacher_actor_prefix: kimi-k3-sddd-teacher
-    # Two queued batches per replica keeps all four teachers busy while the
-    # draft consumes the oldest completed batch.
-    stream_prefetch_batches: 8
+    # Batches in flight, dealt to the teachers round robin. A batch's teacher
+    # time varies with its row lengths by a few seconds, so a teacher that has
+    # only its current batch queued idles until the draft submits the next one;
+    # keep this well above teacher_replicas. Each draft segment holds about this
+    # many steps plus two (see the README).
+    stream_prefetch_batches: 12
+    # Teachers put each row into the segment of the draft rank that reads it,
+    # and that rank reads its step with one batch_get_into into a pinned slot.
+    # The launcher sizes the draft segments for it (LUMENRL_DRAFT_MOONCAKE_SEGMENT_SIZE).
+    disagg_batch_receive: true
+    disagg_place_in_consumer: true
     # The launcher overrides this onto CACHE_DIR under SHARED_ROOT.
     teacher_weights_path: /data/cache/kimi_k3_teacher_static_weights.pt
     # DSpark position decay: w_k = exp(-k / gamma)

@@ -67,13 +67,22 @@ export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-spur0}"
 export MOONCAKE_GLOBAL_SEGMENT_SIZE="${MOONCAKE_GLOBAL_SEGMENT_SIZE:-256GB}"
 export MOONCAKE_LOCAL_BUFFER_SIZE="${MOONCAKE_LOCAL_BUFFER_SIZE:-8GB}"
 # Draft ranks only read, and all eight of them register a segment on one node.
-export LUMENRL_DRAFT_MOONCAKE_SEGMENT_SIZE="${LUMENRL_DRAFT_MOONCAKE_SEGMENT_SIZE:-4GB}"
+# With algorithm.spec_distill.disagg_place_in_consumer the teachers put every
+# row into its reader's segment, which must then hold that rank's share of the
+# batches in flight: 64GB per rank held all of it in the 5-node run.
+export LUMENRL_DRAFT_MOONCAKE_SEGMENT_SIZE="${LUMENRL_DRAFT_MOONCAKE_SEGMENT_SIZE:-64GB}"
+# Mooncake's TCP transport opens a connection per transfer unless this is set;
+# any value other than 0/false/no, the empty string included, turns the pool on.
+export MC_TCP_ENABLE_CONNECTION_POOL="${MC_TCP_ENABLE_CONNECTION_POOL:-1}"
 # The segmented producer pool exists to work around the per-MR size limit on
 # RDMA. Over TCP a single store takes an arbitrarily large segment, so the pool
 # collapses to one store and the whole failure mode above disappears.
 export LUMENRL_TEACHER_MOONCAKE_SEGMENT_POOL_SIZE="${LUMENRL_TEACHER_MOONCAKE_SEGMENT_POOL_SIZE:-1}"
 export LUMENRL_TEACHER_MOONCAKE_SEGMENT_SIZE="${LUMENRL_TEACHER_MOONCAKE_SEGMENT_SIZE:-256GB}"
 export LUMENRL_TEACHER_MOONCAKE_POOL_WAIT_SECONDS="${LUMENRL_TEACHER_MOONCAKE_POOL_WAIT_SECONDS:-300}"
+# 1 stages teacher puts in one pinned ring so the forward never waits for a
+# free per-row buffer (lumenrl/transfer/eagle_mooncake_store.py RingPutManager).
+export LUMENRL_MOONCAKE_RING_PUT="${LUMENRL_MOONCAKE_RING_PUT:-1}"
 export LUMEN_MXFP4_AUTOTUNE="${LUMEN_MXFP4_AUTOTUNE:-0}"
 export LUMEN_MXFP4_AUTOTUNE_CACHE="${LUMEN_MXFP4_AUTOTUNE_CACHE:-${SHARED_ROOT}/cache/dspark_mxfp4_autotune_gfx950.json}"
 export LUMEN_MXFP4_GEMM_SHAPE_LOG="${LUMEN_MXFP4_GEMM_SHAPE_LOG:-}"
@@ -203,9 +212,11 @@ COMMON_DOCKER_ARGS=(
     -e "MOONCAKE_GLOBAL_SEGMENT_SIZE=${MOONCAKE_GLOBAL_SEGMENT_SIZE}"
     -e "MOONCAKE_LOCAL_BUFFER_SIZE=${MOONCAKE_LOCAL_BUFFER_SIZE}"
     -e "LUMENRL_DRAFT_MOONCAKE_SEGMENT_SIZE=${LUMENRL_DRAFT_MOONCAKE_SEGMENT_SIZE}"
+    -e "MC_TCP_ENABLE_CONNECTION_POOL=${MC_TCP_ENABLE_CONNECTION_POOL}"
     -e "LUMENRL_TEACHER_MOONCAKE_SEGMENT_POOL_SIZE=${LUMENRL_TEACHER_MOONCAKE_SEGMENT_POOL_SIZE}"
     -e "LUMENRL_TEACHER_MOONCAKE_SEGMENT_SIZE=${LUMENRL_TEACHER_MOONCAKE_SEGMENT_SIZE}"
     -e "LUMENRL_TEACHER_MOONCAKE_POOL_WAIT_SECONDS=${LUMENRL_TEACHER_MOONCAKE_POOL_WAIT_SECONDS}"
+    -e "LUMENRL_MOONCAKE_RING_PUT=${LUMENRL_MOONCAKE_RING_PUT}"
     -e "LUMEN_MXFP4_AUTOTUNE=${LUMEN_MXFP4_AUTOTUNE}"
     -e "LUMEN_MXFP4_AUTOTUNE_CACHE=${LUMEN_MXFP4_AUTOTUNE_CACHE}"
     -e "LUMEN_MXFP4_GEMM_SHAPE_LOG=${LUMEN_MXFP4_GEMM_SHAPE_LOG}"

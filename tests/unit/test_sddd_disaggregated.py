@@ -25,7 +25,7 @@ def test_generated_masks_only_score_teacher_continuation():
 
 def test_prefill_batch_preserves_dataset_loss_mask():
     class EngineStub:
-        def extract_hidden_state_manifest(self, input_ids, attention_mask):
+        def extract_hidden_state_manifest(self, input_ids, attention_mask, row_segments=None):
             assert input_ids.tolist() == [[1, 2, 3]]
             assert attention_mask.tolist() == [[1, 1, 1]]
             return {"mooncake_keys": ["row-0"]}

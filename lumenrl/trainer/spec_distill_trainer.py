@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import math
 import mmap
 import os
 import queue
@@ -176,18 +177,21 @@ class _DisaggRowFetcher:
 
     def _loop(self) -> None:
         while True:
-            manifest = self._req_queue.get()
-            if manifest is _PREFETCH_SENTINEL:
+            item = self._req_queue.get()
+            if item is _PREFETCH_SENTINEL:
                 break
+            manifest, step = item
             try:
-                self._res_queue.put(self._trainer._load_disagg_rows(manifest))
+                self._res_queue.put(self._trainer._load_disagg_rows(manifest, step=step))
             except BaseException as exc:  # noqa: BLE001 - re-raised in get()
                 self._res_queue.put(exc)
 
-    def submit(self, manifest: dict[str, Any]) -> None:
-        self._req_queue.put(manifest)
+    def submit(self, manifest: dict[str, Any], step: int) -> None:
+        self._req_queue.put((manifest, step))
 
-    def get(self) -> tuple[list[dict[str, torch.Tensor]], torch.Tensor, torch.Tensor]:
+    def get(
+        self,
+    ) -> tuple[list[dict[str, torch.Tensor]], torch.Tensor, torch.Tensor, dict[str, float]]:
         item = self._res_queue.get()
         if isinstance(item, BaseException):
             raise item
@@ -197,6 +201,187 @@ class _DisaggRowFetcher:
         self._req_queue.put(_PREFETCH_SENTINEL)
         self._worker.join(timeout=5)
 
+
+_HOST_REGISTER_PORTABLE = 1  # cudaHostRegisterPortable
+
+
+def _pinned_host_buffer(size: int) -> torch.Tensor:
+    """Page-locked host memory that, unlike ``pin_memory=True``, is not cached.
+
+    PyTorch keeps freed pinned blocks for reuse, so a grown slot's old block
+    would stay resident; ordinary memory registered with the driver goes back
+    to the OS once its last view is gone.
+    """
+    buffer = torch.empty(size, dtype=torch.uint8)
+    cudart = torch.cuda.cudart()
+    result = cudart.cudaHostRegister(buffer.data_ptr(), size, _HOST_REGISTER_PORTABLE)
+    if result != cudart.cudaError.success:
+        raise RuntimeError(f"cudaHostRegister of {size / 2**30:.2f} GiB failed: {result}")
+    return buffer
+
+
+def _unpin_host_buffer(buffer: torch.Tensor) -> None:
+    torch.cuda.cudart().cudaHostUnregister(buffer.data_ptr())
+
+
+class _DisaggReceiveSlots:
+    """Two pinned host slots that a draft rank's step rows are read into.
+
+    Step n reads into slot n % 2 on the fetcher thread while step n - 1 trains
+    out of the other one. The training loop releases a step's slot once its
+    optimizer step returns: every H2D before that is a synchronous ``.to``, and
+    the fetch that reuses the slot is only queued in the iteration after.
+
+    A step that needs more than its slot holds grows that slot to the next
+    power of two, up to ``max_size``; a step above that gets no slot and its
+    rows take the per-row path.
+    """
+
+    def __init__(self, store: Any, size: int, max_size: int) -> None:
+        if size > max_size:
+            raise ValueError(
+                f"receive slot size {size} is above its maximum {max_size}"
+            )
+        self._store = store
+        self.max_size = max_size
+        self._slots = [self._allocate(size) for _ in range(2)]
+        self._holder: list[int | None] = [None, None]
+        self._lock = threading.Lock()
+        self._too_large = 0
+
+    def _allocate(self, size: int) -> torch.Tensor:
+        slot = _pinned_host_buffer(size)
+        try:
+            self._store.register_read_buffer(slot.data_ptr(), size)
+        except BaseException:
+            _unpin_host_buffer(slot)
+            raise
+        return slot
+
+    def acquire(self, step: int, nbytes: int) -> torch.Tensor | None:
+        """Hold slot ``step % 2`` for *step*: the slot, or None if *nbytes* cannot fit."""
+        index = step % 2
+        with self._lock:
+            if self._holder[index] is not None:
+                raise RuntimeError(
+                    f"receive slot {index} is still held by step {self._holder[index]} "
+                    f"when step {step} needs it"
+                )
+            self._holder[index] = step
+        if nbytes <= self._slots[index].numel():
+            return self._slots[index]
+        if nbytes <= self.max_size:
+            size = min(1 << (nbytes - 1).bit_length(), self.max_size)
+            if self._grow(index, size):
+                return self._slots[index]
+        self._too_large += 1
+        if self._too_large == 1 or self._too_large % 100 == 0:
+            logger.warning(
+                "step %d needs %.2f GiB of receive slot, more than it can grow to "
+                "(%.2f GiB); reading its rows one by one (%d steps so far)",
+                step, nbytes / 2**30, self.max_size / 2**30, self._too_large,
+            )
+        return None
+
+    def _grow(self, index: int, size: int) -> bool:
+        old = self._slots[index]
+        start = time.monotonic()
+        try:
+            new = self._allocate(size)
+        except Exception as exc:  # noqa: BLE001 - out of pinned memory, say
+            self.max_size = max(slot.numel() for slot in self._slots)
+            logger.warning(
+                "cannot grow receive slot %d from %.2f to %.2f GiB, so it stays "
+                "at most %.2f GiB: %s",
+                index, old.numel() / 2**30, size / 2**30, self.max_size / 2**30, exc,
+            )
+            return False
+        self._slots[index] = new
+        self._store.unregister_read_buffer(old.data_ptr())
+        _unpin_host_buffer(old)
+        logger.info(
+            "receive slot %d grown from %.2f to %.2f GiB in %.1fs",
+            index, old.numel() / 2**30, size / 2**30, time.monotonic() - start,
+        )
+        return True
+
+    def release(self, step: int) -> None:
+        with self._lock:
+            if self._holder[step % 2] == step:
+                self._holder[step % 2] = None
+
+    def free(self) -> None:
+        """Unpin both slots; the store holding their registration is closed first."""
+        for slot in self._slots:
+            _unpin_host_buffer(slot)
+        self._slots.clear()
+
+
+_RECEIVE_SLOT_ALIGN = 256
+
+
+def _read_disagg_rows_into_slot(
+    store: Any,
+    slots: Any,
+    step: int,
+    keys: list[str],
+    seq_lens: list[int],
+    hidden_width: int,
+    hidden_dim: int,
+) -> list[dict[str, torch.Tensor]] | None:
+    """Read rows' ``_hs``/``_ids``/``_lhs`` into *step*'s slot; the rows are views of it.
+
+    Returns None, reading nothing, when ``slots`` has no slot the rows fit in.
+    The keys are removed whether or not the read succeeds.
+    """
+    specs = (
+        ("hidden_states", "_hs", (hidden_width,), torch.bfloat16),
+        ("input_ids", "_ids", (), torch.int64),
+        ("last_hidden_states", "_lhs", (hidden_dim,), torch.bfloat16),
+    )
+    layout = []
+    offset = 0
+    for key, seq_len in zip(keys, seq_lens, strict=True):
+        for name, suffix, tail, dtype in specs:
+            shape = (int(seq_len), *tail)
+            size = math.prod(shape) * dtype.itemsize
+            layout.append((name, f"{key}{suffix}", offset, size, shape, dtype))
+            offset = (offset + size + _RECEIVE_SLOT_ALIGN - 1) // _RECEIVE_SLOT_ALIGN * _RECEIVE_SLOT_ALIGN
+    slot = slots.acquire(step, offset)
+    if slot is None:
+        return None
+    base = slot.data_ptr()
+    try:
+        store.get_into(
+            [item[1] for item in layout],
+            [base + item[2] for item in layout],
+            [item[3] for item in layout],
+        )
+    finally:
+        store.remove_keys([item[1] for item in layout])
+    rows = []
+    for start in range(0, len(layout), len(specs)):
+        rows.append({
+            name: slot[offset:offset + size].view(dtype).view(shape)
+            for name, _, offset, size, shape, dtype in layout[start:start + len(specs)]
+        })
+    return rows
+
+
+# Also logged as "<key>_max": the slowest rank is what the barrier waits on.
+_MAX_REDUCED_METRICS = (
+    "timing/fetch_wait_s",
+    "timing/barrier_s",
+    "timing/train_s",
+    "timing/fwd_bwd_s",
+    "fetch/total_s",
+    "fetch/get_s",
+    "fetch/get_retry_sleep_s",
+    "fetch/copy_s",
+    "fetch/remove_s",
+    "fetch/row_max_s",
+    "fetch/tokens",
+)
 
 _SHM_SLOTS = 3
 _SHM_POLL_MS = 0.001
@@ -456,6 +641,42 @@ class SpecDistillTrainer:
         )
         for key, value in zip(keys, values.tolist(), strict=True):
             metrics[key] = float(value)
+
+    def _sync_device(self) -> None:
+        if self._device.type == "cuda":
+            torch.cuda.current_stream(self._device).synchronize()
+
+    def _max_metrics_across_ranks(
+        self,
+        metrics: dict[str, float],
+        keys: list[str],
+    ) -> None:
+        """Replace ``keys`` with their maximum over ranks, in one collective."""
+        if not self._is_distributed or not keys:
+            return
+        values = torch.tensor(
+            [metrics[key] for key in keys],
+            dtype=torch.float64,
+            device=self._device,
+        )
+        torch.distributed.all_reduce(
+            values, op=torch.distributed.ReduceOp.MAX,
+        )
+        for key, value in zip(keys, values.tolist(), strict=True):
+            metrics[key] = float(value)
+
+    @staticmethod
+    def _teacher_perf_metrics(manifest: dict[str, Any]) -> dict[str, float]:
+        """Flatten the teacher's per-batch timings into ``teacher/*`` metrics."""
+        metrics: dict[str, float] = {}
+        for key, value in (manifest.get("teacher_perf") or {}).items():
+            if key == "end_time" or not isinstance(value, (int, float)):
+                continue
+            if key.endswith("_bytes"):
+                metrics[f"teacher/{key[:-len('_bytes')]}_gib"] = float(value) / 2**30
+            else:
+                metrics[f"teacher/{key}"] = float(value)
+        return metrics
 
     def _sum_loss_denominators(
         self,
@@ -1033,9 +1254,44 @@ class SpecDistillTrainer:
                 "hidden_dim": int(self._lm_head_weight.shape[1]),
             }
         )
+        batch_receive = bool(getattr(spec_cfg, "disagg_batch_receive", False))
+        if batch_receive:
+            # The draft never puts; its staging pool would only pin host memory.
+            mooncake_values["async_put_pool_size"] = 0
         consumer_config = MooncakeConfig(**mooncake_values)
         self._disagg_mooncake_store = EagleMooncakeStore(consumer_config)
         self._disagg_mooncake_store.setup()
+        self._disagg_receive_slots = None
+        if batch_receive:
+            slot_size = MooncakeConfig.parse_size(str(spec_cfg.disagg_receive_slot_size))
+            slot_max = MooncakeConfig.parse_size(str(spec_cfg.disagg_receive_slot_max_size))
+            self._disagg_receive_slots = _DisaggReceiveSlots(
+                self._disagg_mooncake_store, slot_size, slot_max,
+            )
+            logger.info(
+                "[rank %d] draft batch receive: 2 x %.1f GiB pinned slots (growing up to %.1f GiB)",
+                self._rank, slot_size / 2**30, slot_max / 2**30,
+            )
+        # Rank 0 names, per submitted row, the segment of the rank that reads it.
+        self._draft_segment_names = None
+        if bool(getattr(spec_cfg, "disagg_place_in_consumer", False)):
+            if getattr(self.config.algorithm.teacher, "generate_mode", "prefill") != "prefill":
+                raise ValueError(
+                    "disagg_place_in_consumer needs teacher.generate_mode=prefill: "
+                    "on-policy row lengths are only known after generation"
+                )
+            own_segment = self._disagg_mooncake_store.segment_name()
+            names: list[str | None] = [None] * self._world_size
+            if self._is_distributed:
+                torch.distributed.all_gather_object(names, own_segment)
+            else:
+                names = [own_segment]
+            self._draft_segment_names = names
+            self._disagg_mooncake_store.measure_own_segment = True
+            logger.info(
+                "[rank %d] teacher rows go to their reader's segment; mine is %s",
+                self._rank, own_segment,
+            )
 
         self._teacher_ray_actors = []
         self._ray = None
@@ -3327,10 +3583,23 @@ class SpecDistillTrainer:
         """
         spec_cfg = self.config.algorithm.spec_distill
         draft_dtype = next(self._draft_model.parameters()).dtype
+        # Set only by the streaming loop with LUMENRL_TRAIN_TIMING_SYNC=1; the
+        # syncs make the H2D, forward and backward boundaries real.
+        timings = getattr(self, "_train_timings", None)
+        h2d_start = time.monotonic()
         aux_hidden = teacher_data["hidden_states"].to(
             device=self._device, dtype=draft_dtype,
         )
         input_ids = teacher_data["input_ids"].to(self._device)
+        target_hs = teacher_data.get("last_hidden_states")
+        if target_hs is not None:
+            target_hs = target_hs.to(
+                device=self._device, dtype=draft_dtype,
+            )
+        if timings is not None:
+            self._sync_device()
+            forward_start = time.monotonic()
+            timings["h2d_s"] += forward_start - h2d_start
 
         if not hasattr(self, "_lm_head_w_gpu") or self._lm_head_w_gpu is None:
             self._lm_head_w_gpu = self._lm_head_weight.to(
@@ -3352,11 +3621,7 @@ class SpecDistillTrainer:
             else attention_mask.to(self._device)
         )
 
-        target_hs = teacher_data.get("last_hidden_states")
         if target_hs is not None:
-            target_hs = target_hs.to(
-                device=self._device, dtype=draft_dtype,
-            )
             # vLLM splits the last auxiliary layer into last_hidden_states.
             if spec_cfg.separate_last_hidden:
                 aux_hidden = torch.cat([aux_hidden, target_hs], dim=-1)
@@ -3386,10 +3651,17 @@ class SpecDistillTrainer:
         )
 
         total_loss = result["total_loss"]
+        if timings is not None:
+            self._sync_device()
+            backward_start = time.monotonic()
+            timings["forward_s"] += backward_start - forward_start
         num_accum = getattr(self, "_grad_accum_steps", 1)
         (total_loss / num_accum).backward()
 
+        # Reading the loss waits for the backward queued ahead of it.
         metrics: dict[str, float] = {"loss": float(total_loss.detach())}
+        if timings is not None:
+            timings["backward_s"] += time.monotonic() - backward_start
         metrics["ce_loss"] = float(result["ce_loss"])
         metrics["tv_loss"] = float(result["tv_loss"])
         metrics["conf_loss"] = float(result["conf_loss"])
@@ -4007,11 +4279,24 @@ class SpecDistillTrainer:
         )
         if generate_mode == "prefill":
             input_ids, attention_mask, loss_mask = self._get_batch_sequences(step)
+            row_segments = None
+            names = getattr(self, "_draft_segment_names", None)
+            if names is not None:
+                # The lengths the teacher will publish: the mask sum, clamped to
+                # [1, width] by its worker.
+                width = int(input_ids.shape[1])
+                lengths = attention_mask.sum(dim=1).clamp(1, width).tolist()
+                owners = [0] * len(lengths)
+                for rank in range(self._world_size):
+                    for row in self._default_disagg_rows(lengths, rank):
+                        owners[row] = rank
+                row_segments = [names[owner] for owner in owners]
             return actor.process_prefill_batch.remote(
                 step,
                 input_ids.cpu(),
                 attention_mask.cpu(),
                 loss_mask.cpu(),
+                row_segments=row_segments,
             )
         prompt_ids, prompt_mask, _ = self._get_batch_prompts(step)
         return actor.process_on_policy_batch.remote(
@@ -4022,7 +4307,24 @@ class SpecDistillTrainer:
         payload: dict[str, Any] | None = None
         if self._rank == 0:
             try:
-                payload = {"manifest": self._ray.get(ref)}
+                wait_start = time.time()
+                manifest = self._ray.get(ref)
+                ray_s = time.time() - wait_start
+                # The part of ray.get spent before the teacher finished; the
+                # rest is moving the manifest. end_time is the teacher node's
+                # wall clock, so clamp away clock skew.
+                end_time = (manifest.get("teacher_perf") or {}).get("end_time")
+                teacher_wait_s = (
+                    0.0 if end_time is None
+                    else min(ray_s, max(0.0, end_time - wait_start))
+                )
+                payload = {
+                    "manifest": manifest,
+                    "timing": {
+                        "timing/manifest_ray_s": ray_s,
+                        "timing/manifest_teacher_wait_s": teacher_wait_s,
+                    },
+                }
             except Exception as exc:
                 payload = {"error": f"{type(exc).__name__}: {exc}"}
         obj = [payload]
@@ -4033,13 +4335,15 @@ class SpecDistillTrainer:
             raise RuntimeError("rank 0 did not broadcast a teacher manifest")
         if "error" in payload:
             raise RuntimeError(f"remote ATOM teacher failed: {payload['error']}")
+        self._last_manifest_timing = payload["timing"]
         return payload["manifest"]
 
     def _load_disagg_rows(
         self,
         manifest: dict[str, Any],
         rows: list[int] | None = None,
-    ) -> tuple[list[dict[str, torch.Tensor]], torch.Tensor, torch.Tensor]:
+        step: int | None = None,
+    ) -> tuple[list[dict[str, torch.Tensor]], torch.Tensor, torch.Tensor, dict[str, float]]:
         """Fetch this draft rank's disjoint rows, each at its own length.
 
         ``rows`` defaults to the ``rank::world_size`` stride, or to a
@@ -4053,6 +4357,14 @@ class SpecDistillTrainer:
         copy was padding that ``_streaming_disaggregated_train`` then sliced back
         off before the forward pass. Callers that genuinely need one rectangular
         tensor go through ``_collate_disagg_rows``.
+
+        With batch receive on, the training loop passes ``step`` and the rows are
+        views of that step's pinned receive slot, valid until the loop releases
+        it. Without ``step`` (eval) every row is its own clone.
+
+        The last element is this fetch's ``fetch/*`` timings. Its keys are the
+        same on every rank and every call, because the metric all-reduce pairs
+        values by position.
         """
         keys = manifest["mooncake_keys"]
         seq_lens = manifest["sequence_lengths"]
@@ -4065,12 +4377,7 @@ class SpecDistillTrainer:
                 f"draft world size {self._world_size}"
             )
         if rows is None:
-            if os.environ.get("LUMENRL_BALANCE_DISAGG_ROWS", "0") == "1":
-                rows = _balanced_disagg_rows(
-                    seq_lens, self._world_size, self._rank
-                )
-            else:
-                rows = list(range(self._rank, batch_size, self._world_size))
+            rows = self._default_disagg_rows(seq_lens, self._rank)
         hidden_dim = int(manifest["hidden_dim"])
         num_aux_layers = int(manifest["num_aux_layers"])
         actual_aux_ids = list(manifest.get("aux_layer_ids") or [])
@@ -4117,8 +4424,31 @@ class SpecDistillTrainer:
             )
             self._teacher_hidden_contract_logged = True
 
-        fetched: list[dict[str, torch.Tensor]] = []
-        for row in rows:
+        timings = getattr(self._disagg_mooncake_store, "timings", None)
+        if timings is not None:
+            timings.pop()
+        fetch_start = time.monotonic()
+        row_max_s = 0.0
+        fetched: list[dict[str, torch.Tensor]] | None = None
+        fallback = 0.0
+        slots = getattr(self, "_disagg_receive_slots", None)
+        if slots is not None and step is not None:
+            fetched = _read_disagg_rows_into_slot(
+                self._disagg_mooncake_store,
+                slots,
+                step,
+                [keys[row] for row in rows],
+                [int(seq_lens[row]) for row in rows],
+                hidden_width,
+                hidden_dim,
+            )
+            if fetched is None:
+                fallback = 1.0
+        rows_to_get = rows if fetched is None else []
+        if fetched is None:
+            fetched = []
+        for row in rows_to_get:
+            row_start = time.monotonic()
             seq_len = int(seq_lens[row])
             output = self._disagg_mooncake_store.get(
                 keys[row],
@@ -4142,8 +4472,59 @@ class SpecDistillTrainer:
             self._disagg_mooncake_store.remove_eagle3_tensors(
                 keys[row], has_last_hidden_states=True, has_target=False,
             )
+            row_max_s = max(row_max_s, time.monotonic() - row_start)
 
-        return fetched, attention_mask[rows].contiguous(), loss_mask[rows].contiguous()
+        total_s = time.monotonic() - fetch_start
+        store_perf = timings.pop() if timings is not None else {}
+        get_s = store_perf.get("get_s", 0.0)
+        gib = store_perf.get("get_bytes", 0.0) / 2**30
+        # Present only for a placed step read into its slot.
+        own_bytes = store_perf.get("own_segment_bytes")
+        if own_bytes is not None and gib > 0 and own_bytes / 2**30 < 0.99 * gib:
+            self._misplaced_fetches = getattr(self, "_misplaced_fetches", 0) + 1
+            if self._misplaced_fetches == 1 or self._misplaced_fetches % 100 == 0:
+                logger.warning(
+                    "[rank %d] step %s: %.1f%% of the bytes read were in this "
+                    "rank's own segment; the rest most likely landed elsewhere "
+                    "because it was full, so raise LUMENRL_DRAFT_MOONCAKE_SEGMENT_SIZE "
+                    "(now %s) to hold the batches in flight (%d steps so far)",
+                    self._rank, step, 100 * own_bytes / 2**30 / gib,
+                    getattr(self._disagg_mooncake_store.config, "global_segment_size", "?"),
+                    self._misplaced_fetches,
+                )
+        fetch_perf = {
+            "fetch/total_s": total_s,
+            "fetch/get_s": get_s,
+            "fetch/get_calls": store_perf.get("get_calls", 0.0),
+            "fetch/get_retry_sleep_s": store_perf.get("get_retry_sleep_s", 0.0),
+            "fetch/copy_s": store_perf.get("copy_s", 0.0),
+            "fetch/remove_s": store_perf.get("remove_s", 0.0),
+            "fetch/row_max_s": row_max_s,
+            "fetch/rows": float(len(rows)),
+            "fetch/tokens": float(sum(int(seq_lens[row]) for row in rows)),
+            "fetch/gib": gib,
+            "fetch/get_gib_s": gib / get_s if get_s > 0 else 0.0,
+            # Batch receive on, but this rank's rows did not fit its slot.
+            "fetch/slot_fallback": fallback,
+            # Read from this rank's own segment; counted only with placement on.
+            "fetch/own_segment_gib": store_perf.get("own_segment_bytes", 0.0) / 2**30,
+        }
+        return (
+            fetched,
+            attention_mask[rows].contiguous(),
+            loss_mask[rows].contiguous(),
+            fetch_perf,
+        )
+
+    def _default_disagg_rows(self, seq_lens, rank: int) -> list[int]:
+        """The rows *rank* fetches when ``_load_disagg_rows`` is not given any.
+
+        Rank 0 also uses this at submit time to place each row in its reader's
+        segment, so the two sides always agree.
+        """
+        if os.environ.get("LUMENRL_BALANCE_DISAGG_ROWS", "0") == "1":
+            return _balanced_disagg_rows(seq_lens, self._world_size, rank)
+        return list(range(rank, len(seq_lens), self._world_size))
 
     @staticmethod
     def _collate_disagg_rows(
@@ -4205,7 +4586,7 @@ class SpecDistillTrainer:
         rows: list[int] | None = None,
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
         """One rectangular batch padded to the manifest width. Used by eval."""
-        fetched, attention_mask, loss_mask = self._load_disagg_rows(manifest, rows)
+        fetched, attention_mask, loss_mask, _ = self._load_disagg_rows(manifest, rows)
         width = int(manifest["input_ids"].shape[1])
         return self._collate_disagg_rows(fetched, width), attention_mask, loss_mask
 
@@ -4274,43 +4655,80 @@ class SpecDistillTrainer:
             man = self._receive_disaggregated_manifest(ready_ref)
             manifests[step_idx] = man
             if fetcher is not None:
-                fetcher.submit(man)
+                fetcher.submit(man, step_idx)
 
         if start_step < total_steps:
             _receive_and_start(start_step)
 
+        # Splitting each micro-batch into H2D, forward and backward takes a
+        # device sync between them, which stops the CPU from queueing the
+        # backward under the forward; profiling only.
+        timing_sync = os.environ.get("LUMENRL_TRAIN_TIMING_SYNC", "0") == "1"
+        prev_train_end: float | None = None
         for step in range(start_step, total_steps):
             self.global_step = step
             if self._rank == 0:
                 for cb in self.callbacks:
                     cb.on_step_begin(self, step)
             step_start = time.time()
+            # Metric all-reduce and callbacks (logging, checkpoint, eval) of the
+            # previous step; outside timing/step_s but part of the step period.
+            prev_tail = 0.0 if prev_train_end is None else step_start - prev_train_end
 
             manifest = manifests.pop(step)
-            if fetcher is not None:
-                fetched, attention_mask, loss_mask = fetcher.get()
-            else:
-                fetched, attention_mask, loss_mask = self._load_disagg_rows(manifest)
-            fetch_wait = time.time() - step_start
+            fetch_error: Exception | None = None
+            try:
+                if fetcher is not None:
+                    fetched, attention_mask, loss_mask, fetch_perf = fetcher.get()
+                else:
+                    fetched, attention_mask, loss_mask, fetch_perf = (
+                        self._load_disagg_rows(manifest, step=step)
+                    )
+            except Exception as exc:  # noqa: BLE001 - raised below on every rank
+                fetch_error = exc
+            fetch_end = time.time()
 
+            failed = fetch_error is not None
             if self._is_distributed:
                 # Every rank owns different keys. Do not let the teacher write a
                 # third batch into a segment until all ranks removed the oldest.
                 # This has to sit after the fetch above and before the next one is
                 # queued below, which is the same ordering as the inline version.
-                torch.distributed.barrier()
+                # It is an all-reduce of a failure flag rather than a barrier so
+                # that one rank's failed fetch stops every rank here instead of
+                # leaving the others blocked in their next collective.
+                status = torch.tensor([float(failed)], device=self._device)
+                torch.distributed.all_reduce(status, op=torch.distributed.ReduceOp.MAX)
+                failed = bool(status.item())
+            if failed:
+                if fetch_error is not None:
+                    raise RuntimeError(
+                        f"[rank {self._rank}] step {step}: draft fetch failed"
+                    ) from fetch_error
+                raise RuntimeError(
+                    f"[rank {self._rank}] step {step}: another draft rank's fetch "
+                    "failed; see its log"
+                )
+            barrier_end = time.time()
             if self._rank == 0 and next_submit_step < total_steps:
                 pending[next_submit_step] = self._submit_disaggregated_teacher_batch(
                     next_submit_step
                 )
                 next_submit_step += 1
+            submit_end = time.time()
 
             # Queue the next step's fetch before training rather than after, so
             # it runs underneath the draft's forward and backward.
+            manifest_timing = {
+                "timing/manifest_ray_s": 0.0,
+                "timing/manifest_teacher_wait_s": 0.0,
+            }
             if step + 1 < total_steps:
                 _receive_and_start(step + 1)
+                manifest_timing = self._last_manifest_timing
+            manifest_end = time.time()
 
-            teacher_time = time.time() - step_start
+            teacher_time = manifest_end - step_start
             local_batch = int(attention_mask.shape[0])
             configured_mb = int(
                 getattr(self.config.policy, "train_micro_batch_size", 1) or 1
@@ -4365,6 +4783,7 @@ class SpecDistillTrainer:
                 prepared_chunks.append(
                     (mb_teacher, mb_mask, mb_loss_mask)
                 )
+            prep_end = time.time()
 
             loss_metadata_by_chunk = None
             global_denominators = None
@@ -4393,7 +4812,15 @@ class SpecDistillTrainer:
                 global_denominators = self._sum_loss_denominators(
                     local_denominators
                 )
+                if timing_sync:
+                    # Otherwise its GPU tail lands in the first micro-batch's H2D.
+                    self._sync_device()
+            metadata_end = time.time()
 
+            self._train_timings = (
+                {"h2d_s": 0.0, "forward_s": 0.0, "backward_s": 0.0}
+                if timing_sync else None
+            )
             for index, (mb_teacher, mb_mask, mb_loss_mask) in enumerate(
                 prepared_chunks
             ):
@@ -4421,22 +4848,53 @@ class SpecDistillTrainer:
                     if isinstance(value, float) and value == value:
                         metrics_accum[key] = metrics_accum.get(key, 0.0) + value
 
+            fwd_bwd_end = time.time()
+            train_timings, self._train_timings = self._train_timings, None
+
             metrics = {
                 key: value / max(len(chunks), 1)
                 for key, value in metrics_accum.items()
             }
-            grad_norm = self._optimizer.step()
+            grad_norm = float(self._optimizer.step())
+            train_end = time.time()
+            slots = getattr(self, "_disagg_receive_slots", None)
+            if slots is not None:
+                slots.release(step)
             metrics.update(
                 {
-                    "grad_norm": float(grad_norm),
+                    "grad_norm": grad_norm,
                     "lr": self._optimizer.get_learning_rate(),
-                    "timing/step_s": time.time() - step_start,
+                    "timing/step_s": train_end - step_start,
                     "timing/teacher_s": teacher_time,
                     # How much of the fetch the prefetch thread failed to hide.
                     # Near zero means the overlap is working; if it climbs to the
                     # old teacher_s the teacher, not the fetch, is the bottleneck.
-                    "timing/fetch_wait_s": fetch_wait,
-                    "timing/train_s": time.time() - train_start,
+                    "timing/fetch_wait_s": fetch_end - step_start,
+                    # Waiting on the slowest rank's fetch.
+                    "timing/barrier_s": barrier_end - fetch_end,
+                    # Rank 0 only; max-reduced below so it is not divided by 8.
+                    "timing/submit_s": submit_end - barrier_end,
+                    # Rank 0 waiting on the teacher for step + 1, then the
+                    # broadcast that every other rank waits on. Split into
+                    # manifest_ray_s (of which manifest_teacher_wait_s) and the
+                    # broadcast that remains.
+                    "timing/manifest_s": manifest_end - submit_end,
+                    **manifest_timing,
+                    "timing/prev_tail_s": prev_tail,
+                    "timing/train_s": train_end - train_start,
+                    "timing/train_prep_s": prep_end - train_start,
+                    "timing/loss_metadata_s": metadata_end - prep_end,
+                    # Micro-batch loop; with LUMENRL_TRAIN_TIMING_SYNC=1 it
+                    # contains h2d_s, forward_s and backward_s.
+                    "timing/fwd_bwd_s": fwd_bwd_end - metadata_end,
+                    **{f"timing/{key}": value for key, value in (train_timings or {}).items()},
+                    # Includes any gradient reduce still in flight.
+                    "timing/optimizer_s": train_end - fwd_bwd_end,
+                    "manifest/mib": sum(
+                        value.numel() * value.element_size()
+                        for value in manifest.values()
+                        if isinstance(value, torch.Tensor)
+                    ) / 2**20,
                     # Manifest width, i.e. the longest row in the global batch --
                     # kept for comparability with the runs that padded every row
                     # to it. row_max_len is what this rank actually copies now.
@@ -4447,6 +4905,14 @@ class SpecDistillTrainer:
                     "teacher/replica": float(manifest["replica_index"]),
                 }
             )
+            metrics.update(fetch_perf)
+            metrics.update(self._teacher_perf_metrics(manifest))
+            max_keys = ["timing/submit_s"]
+            for key in _MAX_REDUCED_METRICS:
+                metrics[f"{key}_max"] = metrics[key]
+                max_keys.append(f"{key}_max")
+            prev_train_end = train_end
+            self._max_metrics_across_ranks(metrics, max_keys)
             self._average_metrics_across_ranks(metrics)
             self.last_metrics = metrics
             for cb in self.callbacks:
@@ -4853,6 +5319,10 @@ class SpecDistillTrainer:
                     exc,
                 )
             self._disagg_mooncake_store = None
+        slots = getattr(self, "_disagg_receive_slots", None)
+        if slots is not None:
+            slots.free()
+            self._disagg_receive_slots = None
         del self._teacher_model, self._draft_model
         self._teacher_model = None
         self._draft_model = None

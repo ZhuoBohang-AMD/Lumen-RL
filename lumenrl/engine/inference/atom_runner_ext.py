@@ -30,18 +30,29 @@ The guard deliberately covers the *store* only, never the forward path: the
 capture decision is derived from batch metadata, which is identical on every
 rank, so all ranks take the same branch and TP collectives stay in lockstep.
 
+**Capture timing.** TP rank 0 times every capture forward and the store inside
+it, and rewrites cumulative counters (plus the Mooncake store's put counters) to
+``LUMENRL_RUNNER_PERF_FILE`` after each one. The worker that owns this engine
+reads the file after every ``extract_hidden`` and reports the per-batch delta,
+because the runner's own logs never leave the teacher node.
+
 The runner is selected by passing ``runner_qualname`` to ``AsyncLLMEngine``,
 which only ever ``setdefault``s it — so no ATOM source needs patching.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import time
 
 from atom.model_engine.model_runner import ModelRunner
 from atom.rollout.model_runner_ext import RLHFModelRunner
 
 logger = logging.getLogger("atom")
+
+RUNNER_PERF_FILE_ENV = "LUMENRL_RUNNER_PERF_FILE"
 
 
 class LumenRLModelRunner(RLHFModelRunner):
@@ -71,11 +82,57 @@ class LumenRLModelRunner(RLHFModelRunner):
             return ModelRunner.run_model(self, input_ids, batch)
         return super().run_model(input_ids, batch)
 
+    def forward(self, batch, *args, **kwargs):
+        """Time capture forwards on TP rank 0; every other forward is untouched."""
+        if (
+            getattr(self, "rank", 0) != 0
+            or not self._extract_mode
+            or not self._batch_wants_capture(batch)
+        ):
+            return super().forward(batch, *args, **kwargs)
+        start = time.monotonic()
+        result = super().forward(batch, *args, **kwargs)
+        self._record_capture_forward(batch, time.monotonic() - start)
+        return result
+
     def _store_hidden_states(self, batch):
         """Write captured hidden states to Mooncake, from TP rank 0 only."""
         if getattr(self, "rank", 0) != 0:
             return
-        return super()._store_hidden_states(batch)
+        start = time.monotonic()
+        try:
+            return super()._store_hidden_states(batch)
+        finally:
+            self._store_s = getattr(self, "_store_s", 0.0) + time.monotonic() - start
+
+    def _record_capture_forward(self, batch, forward_s: float) -> None:
+        perf = getattr(self, "_capture_perf", None)
+        if perf is None:
+            perf = self._capture_perf = {
+                "forwards": 0, "forward_s": 0.0, "capture_tokens": 0,
+            }
+        perf["forwards"] += 1
+        perf["forward_s"] += forward_s
+        tokens = getattr(batch, "num_scheduled_tokens", None)
+        if tokens is not None:
+            perf["capture_tokens"] += int(sum(tokens))
+
+        path = os.environ.get(RUNNER_PERF_FILE_ENV)
+        if not path:
+            return
+        payload = dict(perf, store_s=getattr(self, "_store_s", 0.0))
+        timings = getattr(getattr(self, "_mooncake_store", None), "timings", None)
+        if timings is not None:
+            payload.update(timings.snapshot())
+        tmp_path = f"{path}.tmp"
+        try:
+            with open(tmp_path, "w") as perf_file:
+                json.dump(payload, perf_file)
+            os.replace(tmp_path, path)
+        except OSError as exc:
+            if not getattr(self, "_perf_write_warned", False):
+                self._perf_write_warned = True
+                logger.warning("cannot write runner perf file %s: %s", path, exc)
 
 
 __all__ = ["LumenRLModelRunner"]

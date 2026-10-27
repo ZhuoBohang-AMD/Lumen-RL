@@ -12,6 +12,7 @@ import os
 import threading
 import time
 import uuid
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional, Tuple
@@ -21,6 +22,19 @@ import torch
 logger = logging.getLogger(__name__)
 
 HIDDEN_STATES_STORAGE_DTYPE = torch.bfloat16
+
+# "1" stages producer puts in one pinned ring with a single PUT thread instead of
+# one row per buffer; see RingPutManager.
+RING_PUT_ENV = "LUMENRL_MOONCAKE_RING_PUT"
+
+# batch_get_into codes for a key whose put has not landed yet:
+# REPLICA_IS_NOT_READY (put in flight) and OBJECT_NOT_FOUND (not started).
+GET_NOT_READY_CODES = (-703, -704)
+GET_INTO_RETRY_SECONDS = 0.05
+
+# A put key "<base>@<segment>" asks the master to place the row in that segment
+# (a store's segment_name()). The suffix stays part of the key for the reader.
+SEGMENT_KEY_SEP = "@"
 
 _DTYPE_ELEMENT_SIZES = {
     torch.float64: 8, torch.float32: 4, torch.bfloat16: 2, torch.float16: 2,
@@ -58,6 +72,41 @@ def _format_bytes(size: int) -> str:
         value /= 1024
 
 
+class TransferTimings:
+    """Thread-safe cumulative counters for Mooncake transfer timing.
+
+    The producer's async put thread and the forward thread update the same
+    counters, so every access takes the lock. Readers either take a cumulative
+    ``snapshot()`` (teacher runner, which reports deltas per batch) or ``pop()``
+    the counters accumulated since the previous pop (draft fetch, per step).
+    ``peak()`` keys hold a running maximum instead of a sum and are named
+    ``*_peak_bytes`` so per-batch delta reporting can pass them through as-is.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._values: Dict[str, float] = {}
+
+    def add(self, **values: float) -> None:
+        with self._lock:
+            for key, value in values.items():
+                self._values[key] = self._values.get(key, 0.0) + float(value)
+
+    def peak(self, **values: float) -> None:
+        with self._lock:
+            for key, value in values.items():
+                self._values[key] = max(self._values.get(key, 0.0), float(value))
+
+    def snapshot(self) -> Dict[str, float]:
+        with self._lock:
+            return dict(self._values)
+
+    def pop(self) -> Dict[str, float]:
+        with self._lock:
+            values, self._values = self._values, {}
+        return values
+
+
 # ---------------------------------------------------------------------------
 # Host / GPU buffer classes
 # ---------------------------------------------------------------------------
@@ -88,13 +137,20 @@ class HostBuffer:
 
 
 class HostBufferPool:
-    def __init__(self, buffer_size: int, pool_size: int = 2):
+    def __init__(self, buffer_size: int, pool_size: int = 2, contiguous: bool = False):
         self.buffer_size = buffer_size
         self.pool_size = pool_size
+        self.contiguous = contiguous
         self._buffers: List[HostBuffer] = []
         self._current_idx = 0
 
     def initialize(self) -> None:
+        if self.contiguous:
+            self._buffers.append(HostBuffer(self.buffer_size * self.pool_size))
+            logger.info("Host buffer ring: %.1fGB (%d x %.1fGB)",
+                        self.buffer_size * self.pool_size / 1024**3,
+                        self.pool_size, self.buffer_size / 1024**3)
+            return
         for _ in range(self.pool_size):
             self._buffers.append(HostBuffer(self.buffer_size))
         logger.info("Host buffer pool: %d x %.1fGB", self.pool_size, self.buffer_size / 1024**3)
@@ -113,9 +169,11 @@ class HostBufferPool:
 
 
 class AsyncPutManager:
-    def __init__(self, store: Any, max_workers: int = 1, replicate_config: Any = None):
+    def __init__(self, store: Any, max_workers: int = 1, replicate_config: Any = None,
+                 timings: Optional[TransferTimings] = None):
         self._store = store
         self._replicate_config = replicate_config
+        self._timings = timings
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="async_put")
         self._in_flight: Dict[int, Future] = {}
         self._last_error: Optional[BaseException] = None
@@ -139,46 +197,66 @@ class AsyncPutManager:
             self._last_error = exc
             raise
 
+    def acquire(self, buf: HostBuffer, nbytes: int) -> int:
+        """Wait until *buf* may be overwritten; return the offset to stage a row at."""
+        self.wait_for_buffer(buf.ptr)
+        return 0
+
     def submit(self, keys, buffer_ptrs, sizes, owner_buffer_ptr,
-               wait_event=None, device_index=None):
+               wait_event=None, device_index=None, replicate_config=None):
         future = self._executor.submit(
-            self._do_put, keys, buffer_ptrs, sizes, wait_event, device_index
+            self._do_put, keys, buffer_ptrs, sizes, wait_event, device_index,
+            replicate_config=replicate_config,
         )
         with self._flight_lock:
             self._in_flight[owner_buffer_ptr] = future
 
     def _do_put(self, keys, buffer_ptrs, sizes, wait_event=None, device_index=None,
-                _max_retries=3, _retry_delay=0.5):
+                _max_retries=3, _retry_delay=0.5, replicate_config=None):
+        config = replicate_config if replicate_config is not None else self._replicate_config
+        start = time.monotonic()
         if wait_event is not None:
             if device_index is not None:
                 torch.cuda.set_device(device_index)
             wait_event.synchronize()
-        for attempt in range(_max_retries):
-            with self._put_lock:
-                if self._replicate_config is not None:
-                    results = self._store.batch_put_from(
-                        keys, buffer_ptrs, sizes, config=self._replicate_config)
+        staged = time.monotonic()
+        lock_wait_s = 0.0
+        try:
+            for attempt in range(_max_retries):
+                lock_start = time.monotonic()
+                with self._put_lock:
+                    lock_wait_s += time.monotonic() - lock_start
+                    if config is not None:
+                        results = self._store.batch_put_from(
+                            keys, buffer_ptrs, sizes, config=config)
+                    else:
+                        results = self._store.batch_put_from(keys, buffer_ptrs, sizes)
+                failures = [(k, r) for k, r in zip(keys, results) if r != 0]
+                if not failures:
+                    if attempt > 0:
+                        logger.info("batch_put_from succeeded on attempt %d for %s",
+                                    attempt + 1, keys[0])
+                    return
+                try:
+                    self._store.batch_remove(keys, force=True)
+                except Exception:
+                    pass
+                if attempt < _max_retries - 1:
+                    detail = ", ".join(f"{k} (code={r})" for k, r in failures)
+                    logger.warning("batch_put_from attempt %d/%d failed: %s; retrying in %.1fs",
+                                   attempt + 1, _max_retries, detail, _retry_delay)
+                    time.sleep(_retry_delay)
+                    _retry_delay *= 2
                 else:
-                    results = self._store.batch_put_from(keys, buffer_ptrs, sizes)
-            failures = [(k, r) for k, r in zip(keys, results) if r != 0]
-            if not failures:
-                if attempt > 0:
-                    logger.info("batch_put_from succeeded on attempt %d for %s",
-                                attempt + 1, keys[0])
-                return
-            try:
-                self._store.batch_remove(keys, force=True)
-            except Exception:
-                pass
-            if attempt < _max_retries - 1:
-                detail = ", ".join(f"{k} (code={r})" for k, r in failures)
-                logger.warning("batch_put_from attempt %d/%d failed: %s; retrying in %.1fs",
-                               attempt + 1, _max_retries, detail, _retry_delay)
-                time.sleep(_retry_delay)
-                _retry_delay *= 2
-            else:
-                detail = ", ".join(f"{k} (code={r})" for k, r in failures)
-                raise RuntimeError(f"async batch_put_from failed after {_max_retries} attempts: {detail}")
+                    detail = ", ".join(f"{k} (code={r})" for k, r in failures)
+                    raise RuntimeError(f"async batch_put_from failed after {_max_retries} attempts: {detail}")
+        finally:
+            if self._timings is not None:
+                self._timings.add(
+                    put_d2h_wait_s=staged - start,
+                    put_lock_wait_s=lock_wait_s,
+                    put_rpc_s=time.monotonic() - staged - lock_wait_s,
+                )
 
     def drain(self) -> None:
         with self._flight_lock:
@@ -195,6 +273,85 @@ class AsyncPutManager:
     def shutdown(self) -> None:
         self.drain()
         self._executor.shutdown(wait=True)
+
+
+class RingPutManager(AsyncPutManager):
+    """Rows appended to one pinned ring, PUT by one thread, freed in submission order.
+
+    With one row per buffer, every row after the second waits for an earlier PUT
+    before it can even be staged. Here a row only waits when the ring is full. A
+    row that does not fit before the end of the ring starts again at offset 0.
+    The single worker completes PUTs in submission order, so making room only
+    ever means waiting for the oldest rows.
+    """
+
+    def __init__(self, store: Any, ring: HostBuffer, replicate_config: Any = None,
+                 timings: Optional[TransferTimings] = None):
+        super().__init__(store, max_workers=1, replicate_config=replicate_config,
+                         timings=timings)
+        self._ring = ring
+        self._head = 0
+        self._rows: deque = deque()  # (start, end, future), oldest first
+
+    def _wait(self, future: Future) -> None:
+        try:
+            future.result()
+        except Exception as exc:
+            self._last_error = exc
+            raise
+
+    def _release_finished(self) -> None:
+        while True:
+            with self._flight_lock:
+                if not self._rows or not self._rows[0][2].done():
+                    return
+                _, _, future = self._rows.popleft()
+            self._wait(future)
+
+    def acquire(self, buf: HostBuffer, nbytes: int) -> int:
+        if buf is not self._ring:
+            raise ValueError("RingPutManager stages rows only in its own ring")
+        if nbytes > self._ring.size:
+            raise ValueError(f"Buffer overflow: need {nbytes}, have {self._ring.size}")
+        self._release_finished()
+        start = self._head if self._head + nbytes <= self._ring.size else 0
+        end = start + nbytes
+        while True:
+            with self._flight_lock:
+                if not any(start < row_end and row_start < end
+                           for row_start, row_end, _ in self._rows):
+                    break
+                _, _, future = self._rows.popleft()
+            self._wait(future)
+        self._head = end
+        return start
+
+    def submit(self, keys, buffer_ptrs, sizes, owner_buffer_ptr,
+               wait_event=None, device_index=None, replicate_config=None):
+        start = buffer_ptrs[0] - self._ring.ptr
+        end = start + sum(sizes)
+        future = self._executor.submit(
+            self._do_put, keys, buffer_ptrs, sizes, wait_event, device_index,
+            replicate_config=replicate_config,
+        )
+        with self._flight_lock:
+            self._rows.append((start, end, future))
+            oldest = self._rows[0][0]
+        if self._timings is not None:
+            used = end - oldest if end > oldest else self._ring.size - oldest + end
+            self._timings.peak(put_ring_peak_bytes=used)
+
+    def drain(self) -> None:
+        with self._flight_lock:
+            rows = list(self._rows)
+        for _, _, future in rows:
+            try:
+                future.result()
+            except Exception as exc:
+                if self._last_error is None:
+                    self._last_error = exc
+        with self._flight_lock:
+            self._rows.clear()
 
 
 class GPUReceiveBuffer:
@@ -288,6 +445,10 @@ class EagleMooncakeStore:
         self._gpu_direct_available = False
         self._copy_stream = None
         self._replicate_config = None
+        self._placement_configs: Dict[str, Any] = {}
+        # get_into also records the bytes it found in this store's own segment.
+        self.measure_own_segment = False
+        self.timings = TransferTimings()
 
     def setup(self, device=None) -> None:
         if self._initialized:
@@ -326,17 +487,30 @@ class EagleMooncakeStore:
 
         self._build_replicate_config()
 
-        pool_size = getattr(self.config, 'async_put_pool_size', None) or 1
+        # 0 is a read-only client: no put staging pool at all.
+        pool_size = getattr(self.config, 'async_put_pool_size', None)
+        if pool_size is None:
+            pool_size = 1
         if pool_size > 0:
             host_buf_size = getattr(self.config, 'host_buffer_size', None) or 512 * 1024**2
-            self._host_buffer_pool = HostBufferPool(buffer_size=host_buf_size, pool_size=pool_size)
+            ring_put = os.environ.get(RING_PUT_ENV, "0") == "1"
+            self._host_buffer_pool = HostBufferPool(
+                buffer_size=host_buf_size, pool_size=pool_size, contiguous=ring_put)
             self._host_buffer_pool.initialize()
             for buf in self._host_buffer_pool._buffers:
                 self._register_buffer(buf.ptr, buf.size)
-            self._async_put_manager = AsyncPutManager(
-                store=self._store, max_workers=pool_size,
-                replicate_config=self._replicate_config,
-            )
+            if ring_put:
+                self._async_put_manager = RingPutManager(
+                    store=self._store, ring=self._host_buffer_pool._buffers[0],
+                    replicate_config=self._replicate_config,
+                    timings=self.timings,
+                )
+            else:
+                self._async_put_manager = AsyncPutManager(
+                    store=self._store, max_workers=pool_size,
+                    replicate_config=self._replicate_config,
+                    timings=self.timings,
+                )
 
         if getattr(self.config, 'enable_gpu_direct', False) and torch.cuda.is_available():
             self._setup_gpu_direct(device)
@@ -397,6 +571,35 @@ class EagleMooncakeStore:
         except ImportError:
             pass
 
+    def segment_name(self) -> str:
+        """The name the master knows this store's segment by (``ip:port``)."""
+        self._ensure_initialized()
+        return self._store.get_hostname()
+
+    def _config_for_key(self, key: str) -> Any:
+        """The put config for *key*: its ``@<segment>`` placement, else the default."""
+        _, sep, segment = key.rpartition(SEGMENT_KEY_SEP)
+        if not sep or not segment:
+            return self._replicate_config
+        config = self._placement_configs.get(segment)
+        if config is None:
+            from mooncake.store import ReplicateConfig
+            config = ReplicateConfig()
+            # replica_num stays 1: Mooncake rejects a preferred_segments list
+            # whose length differs from it.
+            base = self._replicate_config
+            for attr in ("with_hard_pin", "with_soft_pin", "prefer_alloc_in_same_node"):
+                if base is not None and hasattr(base, attr) and hasattr(config, attr):
+                    setattr(config, attr, getattr(base, attr))
+            # The master takes preferred_segment when it is set and
+            # preferred_segments otherwise, and the former is deprecated: set
+            # both, so a base that names its own segment cannot win either way.
+            if hasattr(config, "preferred_segment"):
+                config.preferred_segment = segment
+            config.preferred_segments = [segment]
+            self._placement_configs[segment] = config
+        return config
+
     def _ensure_initialized(self, timeout=30.0):
         if self._init_event.is_set():
             return
@@ -434,22 +637,26 @@ class EagleMooncakeStore:
         if last_hidden_states is not None:
             keys.append(f"{key}_lhs")
             tensors.append(last_hidden_states)
+        config = self._config_for_key(key)
 
         if self._gpu_direct_available and self._gpu_send_buffer is not None:
             buffer_ptrs, sizes = self._stage_tensors_into_buffer(self._gpu_send_buffer, tensors)
-            self._do_sync_batch_put(keys, buffer_ptrs, sizes)
+            self._do_sync_batch_put(keys, buffer_ptrs, sizes, config=config)
         elif self._host_buffer_pool is None or self._async_put_manager is None:
             raise RuntimeError("put() requires host buffer pool or GPU Direct")
         else:
             buf = self._host_buffer_pool.get_buffer()
             self._async_put_manager.check_last_error()
-            self._async_put_manager.wait_for_buffer(buf.ptr)
+            wait_start = time.monotonic()
+            offset = self._async_put_manager.acquire(
+                buf, sum(t.numel() * t.element_size() for t in tensors))
+            stage_start = time.monotonic()
 
             compute_event = torch.cuda.Event()
             compute_event.record()
             with torch.cuda.stream(self._copy_stream):
                 self._copy_stream.wait_event(compute_event)
-                buffer_ptrs, sizes = self._stage_tensors_into_buffer(buf, tensors)
+                buffer_ptrs, sizes = self._stage_tensors_into_buffer(buf, tensors, offset)
                 copy_done = torch.cuda.Event()
                 copy_done.record()
 
@@ -460,6 +667,13 @@ class EagleMooncakeStore:
             self._async_put_manager.submit(
                 keys, buffer_ptrs, sizes, buf.ptr,
                 wait_event=copy_done, device_index=self._copy_stream.device.index,
+                replicate_config=config,
+            )
+            self.timings.add(
+                put_rows=1,
+                put_bytes=sum(sizes),
+                put_wait_s=stage_start - wait_start,
+                put_stage_s=time.monotonic() - stage_start,
             )
 
         shapes = {"hidden_states": tuple(hidden_states.shape), "input_ids": tuple(input_ids.shape)}
@@ -481,10 +695,12 @@ class EagleMooncakeStore:
         self._async_put_manager.check_last_error()
 
     def _do_sync_batch_put(self, keys, buffer_ptrs, sizes,
-                           _max_retries=3, _retry_delay=0.5):
+                           _max_retries=3, _retry_delay=0.5, config=None):
+        if config is None:
+            config = self._replicate_config
         for attempt in range(_max_retries):
-            if self._replicate_config is not None:
-                results = self._store.batch_put_from(keys, buffer_ptrs, sizes, config=self._replicate_config)
+            if config is not None:
+                results = self._store.batch_put_from(keys, buffer_ptrs, sizes, config=config)
             else:
                 results = self._store.batch_put_from(keys, buffer_ptrs, sizes)
             failures = [(k, r) for k, r in zip(keys, results) if r != 0]
@@ -508,9 +724,8 @@ class EagleMooncakeStore:
                 raise RuntimeError(f"batch_put_from failed after {_max_retries} attempts: {detail}")
 
     @staticmethod
-    def _stage_tensors_into_buffer(buf, tensors):
+    def _stage_tensors_into_buffer(buf, tensors, offset=0):
         buffer_ptrs, sizes = [], []
-        offset = 0
         for tensor in tensors:
             nbytes = buf.copy_from_tensor(tensor, offset=offset)
             buffer_ptrs.append(buf.ptr + offset)
@@ -592,9 +807,15 @@ class EagleMooncakeStore:
         wait_seconds = max(getattr(self.config, 'get_retry_wait_seconds', 0.5), 0.05)
         max_wait = max(getattr(self.config, 'get_retry_max_wait_seconds', 60.0), 0.0)
         start_time = time.time()
+        get_calls = 0
+        get_s = 0.0
+        retry_sleep_s = 0.0
 
         while True:
+            call_start = time.monotonic()
             buffers = self._store.batch_get_buffer(keys)
+            get_s += time.monotonic() - call_start
+            get_calls += 1
             missing = [i for i, buf in enumerate(buffers) if buf is None]
             if not missing:
                 break
@@ -602,14 +823,19 @@ class EagleMooncakeStore:
             if max_wait > 0 and elapsed >= max_wait:
                 mk = ", ".join(keys[i] for i in missing)
                 raise RuntimeError(f"batch_get_buffer timed out for: {mk} ({elapsed:.1f}s)")
+            sleep_start = time.monotonic()
             time.sleep(wait_seconds)
+            retry_sleep_s += time.monotonic() - sleep_start
 
+        copy_start = time.monotonic()
+        total_nbytes = 0
         tensor_map = {}
         for i, ((name, shape, dtype), buf) in enumerate(zip(tensor_specs, buffers)):
             numel = 1
             for d in shape:
                 numel *= d
             nbytes = numel * _DTYPE_ELEMENT_SIZES[dtype]
+            total_nbytes += nbytes
             c_arr = (ctypes.c_byte * nbytes).from_address(buf.ptr())
             host_t = torch.frombuffer(c_arr, dtype=dtype, count=numel).reshape(shape)
             if device is not None and device.type != "cpu":
@@ -618,7 +844,101 @@ class EagleMooncakeStore:
                 tensor_map[name] = host_t.clone()
             if name == "input_ids":
                 tensor_map["input_ids_cpu"] = host_t.clone()
+        self.timings.add(
+            get_calls=get_calls,
+            get_s=get_s,
+            get_retry_sleep_s=retry_sleep_s,
+            get_bytes=total_nbytes,
+            copy_s=time.monotonic() - copy_start,
+        )
         return tensor_map
+
+    # ---- GET INTO REGISTERED HOST MEMORY ----
+
+    def register_read_buffer(self, ptr: int, size: int) -> None:
+        """Register host memory as a ``get_into`` target."""
+        self._ensure_initialized()
+        if not self._register_buffer(ptr, size):
+            raise RuntimeError(f"Mooncake could not register a {_format_bytes(size)} read buffer")
+
+    def unregister_read_buffer(self, ptr: int) -> None:
+        """Undo ``register_read_buffer``; call it before freeing the memory."""
+        self._ensure_initialized()
+        if self._store.unregister_buffer(ptr) != 0:
+            raise RuntimeError(f"Mooncake could not unregister read buffer {ptr:#x}")
+        # A later allocation may reuse the address.
+        self._registered_buffers.pop(ptr, None)
+
+    def own_segment_bytes(self, keys: List[str], sizes: List[int]) -> int:
+        """Bytes of *keys* whose first replica sits in this store's own segment."""
+        own = self.segment_name()
+        descs = self._store.batch_get_replica_desc(keys)
+        total = 0
+        for key, size in zip(keys, sizes, strict=True):
+            replicas = descs.get(key) or []
+            if replicas and replicas[0].is_memory_replica():
+                endpoint = replicas[0].get_memory_descriptor().buffer_descriptor.transport_endpoint
+                if endpoint == own:
+                    total += size
+        return total
+
+    def get_into(self, keys: List[str], buffer_ptrs: List[int], sizes: List[int]) -> None:
+        """Read every key into its registered address with one ``batch_get_into``.
+
+        Keys whose put has not landed are retried until
+        ``get_retry_max_wait_seconds``. Any other result, including a byte count
+        other than the key's size, raises.
+        """
+        self._ensure_initialized()
+        max_wait = max(getattr(self.config, 'get_retry_max_wait_seconds', 60.0), 0.0)
+        start = time.monotonic()
+        pending = list(range(len(keys)))
+        get_calls = 0
+        get_s = 0.0
+        retry_sleep_s = 0.0
+
+        while pending:
+            call_start = time.monotonic()
+            codes = self._store.batch_get_into(
+                [keys[i] for i in pending],
+                [buffer_ptrs[i] for i in pending],
+                [sizes[i] for i in pending],
+            )
+            get_s += time.monotonic() - call_start
+            get_calls += 1
+
+            not_ready, failed = [], []
+            for index, code in zip(pending, codes, strict=True):
+                if code == sizes[index]:
+                    continue
+                if code in GET_NOT_READY_CODES:
+                    not_ready.append(index)
+                else:
+                    failed.append(f"{keys[index]}={code} (size {sizes[index]})")
+            if failed:
+                raise RuntimeError(f"batch_get_into failed for {len(failed)} keys: "
+                                   + ", ".join(failed[:8]))
+            if not_ready:
+                elapsed = time.monotonic() - start
+                if max_wait > 0 and elapsed >= max_wait:
+                    raise RuntimeError(
+                        f"batch_get_into timed out after {elapsed:.1f}s for: "
+                        + ", ".join(keys[i] for i in not_ready[:8]))
+                sleep_start = time.monotonic()
+                time.sleep(GET_INTO_RETRY_SECONDS)
+                retry_sleep_s += time.monotonic() - sleep_start
+            pending = not_ready
+
+        self.timings.add(
+            get_calls=get_calls,
+            get_s=get_s,
+            get_retry_sleep_s=retry_sleep_s,
+            get_bytes=sum(sizes),
+        )
+        # Under P2PHANDSHAKE a replica records the transfer engine's address, not
+        # the segment name own_segment_bytes compares it with: all would miss.
+        if self.measure_own_segment and self.config.metadata_server != "P2PHANDSHAKE":
+            self.timings.add(own_segment_bytes=self.own_segment_bytes(keys, sizes))
 
     # ---- REMOVE ----
 
@@ -628,21 +948,30 @@ class EagleMooncakeStore:
             keys.append(f"{key}_tgt")
         if has_last_hidden_states:
             keys.append(f"{key}_lhs")
-        for attempt in range(1, 4):
-            try:
-                results = self._store.batch_remove(keys, force=True)
-            except Exception:
+        self.remove_keys(keys, label=key)
+
+    def remove_keys(self, keys: List[str], label: Optional[str] = None) -> None:
+        """Force-remove keys, retrying failures; a missing key counts as removed."""
+        key = label or f"{len(keys)} keys"
+        start = time.monotonic()
+        try:
+            for attempt in range(1, 4):
+                try:
+                    results = self._store.batch_remove(keys, force=True)
+                except Exception:
+                    if attempt < 3:
+                        time.sleep(0.5)
+                    continue
+                failed = [(k, r) for k, r in zip(keys, results) if r not in (None, 0, -704)]
+                if not failed:
+                    return
                 if attempt < 3:
                     time.sleep(0.5)
-                continue
-            failed = [(k, r) for k, r in zip(keys, results) if r not in (None, 0, -704)]
-            if not failed:
-                return
-            if attempt < 3:
-                time.sleep(0.5)
-                keys = [k for k, _ in failed]
-            else:
-                logger.error("Force delete abandoned for %s: %s", key, failed)
+                    keys = [k for k, _ in failed]
+                else:
+                    logger.error("Force delete abandoned for %s: %s", key, failed)
+        finally:
+            self.timings.add(remove_calls=1, remove_s=time.monotonic() - start)
 
     def close(self):
         if self._async_put_manager is not None:
@@ -743,6 +1072,7 @@ class SegmentedEagleMooncakeStore(EagleMooncakeStore):
             super().__init__(config, *args, **kwargs)
         else:
             self._initialized = False
+            self.timings = TransferTimings()
 
     def setup(self, device=None) -> None:
         if self._pool_size == 1:
@@ -769,6 +1099,10 @@ class SegmentedEagleMooncakeStore(EagleMooncakeStore):
         )
         store = self._store_factory(store_config)
         store.setup(self._current_device())
+        store.timings = self.timings
+        put_manager = getattr(store, "_async_put_manager", None)
+        if put_manager is not None:
+            put_manager._timings = self.timings
         # Mooncake otherwise balances writes across every segment registered
         # with the master. Multiple same-process RDMA clients must write to
         # their own mounted segment; cross-client QPs on one host are neither

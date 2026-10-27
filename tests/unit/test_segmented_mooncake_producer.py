@@ -80,6 +80,7 @@ def test_round_robin_distribution_and_store_configuration(monkeypatch):
     assert all(store.config.global_segment_size == 2 * 1024**3 for store in stores)
     assert all(store.config.local_buffer_size == 1024**3 for store in stores)
     assert all(store.config.async_put_pool_size == 1 for store in stores)
+    assert all(store.timings is pool.timings for store in stores)
 
 
 def test_full_store_fails_over_without_publishing_early(monkeypatch):

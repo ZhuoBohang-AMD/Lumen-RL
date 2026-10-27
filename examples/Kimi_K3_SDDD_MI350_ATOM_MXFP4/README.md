@@ -45,7 +45,7 @@ teacher3 TP=8 ─┘
 Clone both repositories side by side on the shared filesystem:
 
 ```bash
-git clone -b k3-dspark-from-scratch-mxfp4 https://github.com/ZhuoBohang-AMD/Lumen-RL.git
+git clone -b k3-dspark-mxfp4-mooncake-transfer https://github.com/ZhuoBohang-AMD/Lumen-RL.git
 git clone -b k3-dspark-from-scratch-mxfp4 https://github.com/ZhuoBohang-AMD/Lumen.git
 git -C Lumen submodule update --init --recursive
 cd Lumen-RL
@@ -78,6 +78,12 @@ because SLURM kills a step's processes when the step ends. For example:
 ```bash
 onnode() { ssh -o BatchMode=yes "$1" "$2"; }
 ```
+
+NCCL defaults to the `spur0` interface and the HCAs `ionic_0` to `ionic_6`.
+On other hosts export `NCCL_SOCKET_IFNAME` (the interface holding the address
+`hostname -I` prints first), `NCCL_IB_HCA` and `NCCL_IB_GID_INDEX` before
+launching; with an interface the host lacks, NCCL fails at startup with
+`Bootstrap : no socket interface found`.
 
 Set `K3_DRAFT_NODE` to put the draft on a node other than the last one. The
 `srun` commands below are helpers for one-off jobs; adapt them to your
@@ -169,6 +175,16 @@ model revision, data, image, NUMA). It then starts each node's container,
 prints the run ID and log directory, and returns once all five Ray nodes have
 joined; training keeps running on the nodes. Loading the teachers takes about
 20 minutes.
+
+**BF16.** To train the same draft without quantization, add
+`quantization.training.mxfp4=false` to `EXTRA_OVERRIDES` at launch and on every
+resume. Linear layers then stay BF16, Lumen's norm and attention kernels stay
+on, and every other setting is unchanged:
+
+```bash
+EXTRA_OVERRIDES="quantization.training.mxfp4=false" \
+  bash examples/Kimi_K3_SDDD_MI350_ATOM_MXFP4/scripts/launch_multinode.sh
+```
 
 **Monitor.** The draft log `node-00-<draft-host>.log` has the step, loss and
 eval lines; `rank-<r>-<node>.out` has each node's startup. Both are in
@@ -273,6 +289,18 @@ output cap. Chunked prefill is off, so every prompt must fit in
 - **Mooncake runs over TCP, with a 256 GB segment per teacher**, set by
   `run_multinode_rank.sh`. Ionic allows one RDMA client per HCA per process,
   which cannot hold a 32,768-token batch.
+- **Teachers put each row into the segment of the draft rank that reads it, and
+  the rank reads its step with one `batch_get_into`**
+  (`disagg_place_in_consumer`, `disagg_batch_receive`). A draft segment must
+  then hold that rank's share of the batches in flight, about
+  `stream_prefetch_batches + 2` average steps of 3.4 GB; `run_multinode_rank.sh`
+  gives each rank 64 GB, which holds the default 12. Rows that find it full land
+  in other segments and are read over the network, with a warning.
+- **`stream_prefetch_batches: 12`, well above the teacher count.** Batches go to
+  the teachers round robin and a batch's teacher time varies with its row
+  lengths, so a teacher with only its current batch queued idles until the
+  draft submits the next; `teacher/idle_s` in the draft log shows it. Raising
+  it costs draft segment space as above.
 - **The MXFP4 weight selection** is listed in full in the config. The exporter
   quantizes its include list, and the exporter's `ATOM_EXCLUDE` (the layers
   ATOM loads as BF16) must be updated with any change to the selection.

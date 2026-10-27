@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import socket
+import time
 from pathlib import Path
 from typing import Any
 
@@ -106,6 +107,23 @@ class AtomTeacherRayActor:
             (positions >= starts) & (positions < lens)
         ).long()
 
+    def _record_batch_timing(self, manifest: dict[str, Any], start: float) -> None:
+        """Add this call's wall time and the idle gap since the previous one.
+
+        The actor runs one call at a time, so the gap is how long this teacher
+        sat waiting for the trainer to hand it work. ``end_time`` is wall clock
+        so rank 0 can split its ``ray.get`` into waiting for this call to end
+        and moving the manifest.
+        """
+        end = time.time()
+        last_end = getattr(self, "_last_batch_end", None)
+        manifest.setdefault("teacher_perf", {}).update(
+            actor_s=end - start,
+            idle_s=0.0 if last_end is None else start - last_end,
+            end_time=end,
+        )
+        self._last_batch_end = end
+
     def process_on_policy_batch(
         self,
         batch_id: int,
@@ -117,6 +135,7 @@ class AtomTeacherRayActor:
             raise RuntimeError(
                 "process_on_policy_batch requires teacher.generate_mode=generate"
             )
+        start = time.time()
         teacher_cfg = self.config.algorithm.teacher
         full_ids, seq_lens, prompt_lens = self._engine.generate_tokens(
             prompt_ids,
@@ -141,6 +160,7 @@ class AtomTeacherRayActor:
                 "replica_index": self.replica_index,
             }
         )
+        self._record_batch_timing(manifest, start)
         return manifest
 
     def process_prefill_batch(
@@ -149,8 +169,13 @@ class AtomTeacherRayActor:
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         loss_mask: torch.Tensor,
+        row_segments: list[str] | None = None,
     ) -> dict[str, Any]:
-        """Extract teacher states for a response already stored in the dataset."""
+        """Extract teacher states for a response already stored in the dataset.
+
+        ``row_segments`` names, per row, the Mooncake segment to place it in:
+        the segment of the draft rank that will read it.
+        """
         if self._generate_mode != "prefill":
             raise RuntimeError(
                 "process_prefill_batch requires teacher.generate_mode=prefill"
@@ -162,9 +187,11 @@ class AtomTeacherRayActor:
             raise ValueError(
                 "input_ids, attention_mask, and loss_mask must have identical shapes"
             )
+        start = time.time()
         manifest = self._engine.extract_hidden_state_manifest(
             input_ids.contiguous(),
             attention_mask.contiguous(),
+            row_segments=row_segments,
         )
         manifest.update(
             {
@@ -175,6 +202,7 @@ class AtomTeacherRayActor:
                 "replica_index": self.replica_index,
             }
         )
+        self._record_batch_timing(manifest, start)
         return manifest
 
     def export_static_weights(self, output_path: str) -> str:
